@@ -1,4 +1,7 @@
 # Safe and Interactive Crowd Navigation
+
+> Forked from [this repo ](https://github.com/sepsamavi/safe-interactive-crowdnav)
+
 This repository contains the code for our paper **SICNav: Safe and Interactive Crowd Navigation using Model Predictive Control and Bilevel Optimization** including the CrowdSimPlus Simulator.
 
 **[`Website`](http://sepehr.fyi/projects/sicnav) | [`Repo`](https://github.com/sepsamavi/safe-interactive-crowdnav) | [`IEEE Xplore`](https://ieeexplore.ieee.org/document/10726864)| [`arXiv`](https://arxiv.org/abs/2310.10982) | [`Video`](https://tiny.cc/sicnav_overview)**
