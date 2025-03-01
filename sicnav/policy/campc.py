@@ -692,7 +692,7 @@ class CollisionAvoidMPC(Policy):
             final_obj_val = sol.value(opti.f) # final objective value
             opti_stats = opti.debug.stats()
 
-            if self.warmstart and final_obj_val > init_obj_val:
+            if self.warmstart and final_obj_val > init_obj_val:  # smaller obj_value is better
                 # take the initial values as the solution
                 x_val = x_guess
                 u_val = u_guess
@@ -714,6 +714,8 @@ class CollisionAvoidMPC(Policy):
                 self.mpc_sol_succ.append(True)
                 time_text = ', Wall Time: {:.4f}'.format(sol_end-sol_start) if DISP_TIME else ''
                 logging.info('[CAMPC] Optim. success {:} step {:}. Initial: {:.3g} -> Final: {:.3g}. Num Iter: {:}{:}'.format(str(opti.debug.return_status()), self.traj_step, init_obj_val, final_obj_val, opti_stats['iter_count'], time_text))
+            print(f"u_val shape: {u_val.shape}")
+            print(u_val)
             if u_val.ndim > 1:
                 action = u_val[:, 0]
             else:
@@ -721,6 +723,7 @@ class CollisionAvoidMPC(Policy):
             self.prev_action = action
         except Exception as e:
             sol_end = time.time()
+            
             def deal_with_fail():
                 self.mpc_sol_succ.append(False)
                 time_text = ', Wall Time: {:.4f}'.format(sol_end-sol_start) if DISP_TIME else ''
@@ -1325,6 +1328,8 @@ class CollisionAvoidMPC(Policy):
         start_time = time.time()
         mpc_action = self.select_action(mpc_state, state, goal_states, goal_actions)
         end_time = time.time()
+        print(f"len_mpc_action: {len(mpc_action)}")
+        print(mpc_action)
 
         action = ActionRot(mpc_action[0], mpc_action[1]*self.time_step)
         self.prev_lvel = action.v
