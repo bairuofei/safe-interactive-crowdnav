@@ -3,6 +3,8 @@ import numpy as np
 from crowd_sim_plus.envs.utils.agent_plus import Agent
 from crowd_sim_plus.envs.utils.state_plus import JointState, FullyObservableJointState, FullState, ObservableState
 
+from crowd_sim_plus.envs.utils.action import ActionRot, ActionXY
+
 def rot_2D(theta_vi, p_ai_i):
     Rot_vi = np.array([[np.cos(theta_vi), np.sin(theta_vi)],
                       [-np.sin(theta_vi), np.cos(theta_vi)]])
@@ -64,7 +66,28 @@ class Robot(Agent):
             raise AttributeError('Policy attribute has to be set!')
         # state = JointState(self.get_full_state(), ob, static_obs)
         state = self.get_joint_state(ob, static_obs)
-        action = self.policy.predict(state)
+        actions = self.policy.predict(state)
+
+        action_list = []
+        for k in range(actions.shape[1]):
+            mpc_action = actions[:, k]
+            action = ActionRot(mpc_action[0], mpc_action[1]*self.time_step)
+            action_list.append(action)
+
+        print(f"len_action_list: {len(action_list)}")
+        diff_x, diff_y = self.compute_future_direction(action_list, self.time_step)
+        vx = diff_x / (len(action_list) * self.time_step)
+        vy = diff_y / (len(action_list) * self.time_step)
+        action = ActionXY(vx, vy)   
+        self.policy.kinematics = 'holonomic'
+        self.kinematics = 'holonomic'
+        
+        # next_state = self.get_next_full_state(action_list[0], original=False)
+        # print(f"curr_state: {[state.self_state.px, state.self_state.py]}")
+        # print(f"next_state: {next_state[:2]}")
+
+        # mpc_action = actions[:, 0]
+        # action = ActionRot(mpc_action[0], mpc_action[1]*self.time_step)
         return action
 
     def get_joint_state(self, ob, static_obs=[]):
@@ -345,4 +368,6 @@ class RobotFullKnowledge(Robot):
             raise AttributeError('Policy attribute has to be set!')
         state = FullyObservableJointState(self.get_full_state(), ob, static_obs)
         action = self.policy.predict(state)
+        # next_state = self.get_next_full_state(action, original=False)
+
         return action
