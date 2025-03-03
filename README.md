@@ -50,6 +50,8 @@ In a conda environment with Python 3.8.13,
 The following algorithms can be visualized by running the following command in the `sicnav/` directory:
 ```
 python simple_test.py --policy <policy>
+
+python simple_test.py --policy campc
 ```
 
 - Collision Avoidance MPC (`--policy campc`) can be configured in `sicnav/configs/policy.config` to act as the following algorithms described in the paper:
