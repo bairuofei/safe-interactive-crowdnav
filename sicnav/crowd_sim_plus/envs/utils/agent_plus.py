@@ -183,6 +183,21 @@ class Agent(object):
             py = self.py + np.sin(theta) * action.v * delta_t
 
         return px, py
+    
+    def compute_future_direction(self, action_list, delta_t):
+        px = self.px
+        py = self.py
+        theta = self.theta
+        for action in action_list:
+            self.check_validity(action)
+            if self.kinematics == 'holonomic':
+                px += action.vx * delta_t
+                py += action.vy * delta_t
+            else:
+                theta += action.r
+                px += np.cos(theta) * action.v * delta_t
+                py += np.sin(theta) * action.v * delta_t
+        return px - self.px, py - self.py
 
     @staticmethod
     def compute_position_by_state(state, action, delta_t):
