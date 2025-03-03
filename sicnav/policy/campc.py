@@ -4,7 +4,7 @@ import logging
 import time
 import numpy as np
 from crowd_sim_plus.envs.policy.policy import Policy
-from crowd_sim_plus.envs.utils.action import ActionRot
+from crowd_sim_plus.envs.utils.action import ActionRot, ActionXY
 import pandas as pd
 import casadi as cs
 from crowd_sim_plus.envs.utils.human_plus import Human
@@ -29,7 +29,8 @@ class CollisionAvoidMPC(Policy):
     def __init__(self):
         super().__init__()
         self.trainable = False
-        self.kinematics = 'unicycle'
+        # This param only used for environment update. For MPC, it always use unicycle model.
+        self.kinematics = 'unicycle'  # unicycle   holonomic
         self.multiagent_training = True
         self.config = None
 
@@ -565,6 +566,454 @@ class CollisionAvoidMPC(Policy):
 
         return x_prev_fwded, u_prev_fwded
 
+    def select_action_omnidirectional(self, obs, joint_state, goal_states, goal_actions, return_all=False, dummy=False):
+        """Solves nonlinear mpc problem to get next action.
+        Args:
+            obs (np.array): current state/observation.
+
+        Returns:
+            np.array: input/action to the task/env.
+        """
+
+        opti_dict = self.opti_dict
+        opti = opti_dict["opti"]
+        x_var = opti_dict["x_var"]
+        u_var = opti_dict["u_var"]
+        x_init = opti_dict["x_init"]
+        x_ref = opti_dict["x_ref"]
+        u_ref = opti_dict["u_ref"]
+
+        # Assign the initial state.
+        opti.set_value(x_init, obs)
+
+        # Assign reference trajectory within horizon.
+        opti.set_value(x_ref, goal_states)
+        opti.set_value(u_ref, goal_actions)
+
+        # Select x_guess, u_guess
+        start_ref = time.time()
+        if self.x_prev is not None and self.u_prev is not None:
+            for_guess = True if self.mpc_env.hum_model != 'orca_casadi_kkt' or self.mpc_env.orca_kkt_horiz > 0 else False
+            x_prev = deepcopy(self.x_prev)
+            u_prev = deepcopy(self.u_prev)
+            x_prev_fwded, u_prev_fwded = self.bring_fwd(joint_state, obs, x_prev, u_prev, for_guess=for_guess)
+
+        if not self.warmstart or (self.mpc_env.hum_model != 'orca_casadi_kkt' and (self.x_prev is None or self.u_prev is None or self.mpc_sol_succ is None or (not self.mpc_sol_succ[-1] and self.num_prev_used >= self.reuse_K) or self.new_ref_each_step)):
+            for_guess = True if self.mpc_env.hum_model != 'orca_casadi_kkt' or self.mpc_env.orca_kkt_horiz > 0 else False
+            x_guess, u_guess = self.generate_traj(joint_state, self.horiz, for_guess=for_guess)
+            can_use_guess = False # whether or not the guess can be used for the next step in case optimization fails
+        elif self.mpc_env.hum_model == 'orca_casadi_kkt' and (self.x_prev is None or self.u_prev is None or self.mpc_sol_succ is None or not np.any(np.array(self.mpc_sol_succ)) or self.new_ref_each_step):
+            logging.info('[CAMPC] generating warmstart for entire horizon')
+            ans = self.warmstart_horiz(X_0=obs)
+            x_guess = ans['X_vec'].toarray()
+            u_guess = ans['U_vec'].toarray()
+            can_use_guess = True # whether or not the guess can be used for the next step in case optimization fails
+
+        else:
+            x_guess = deepcopy(x_prev_fwded)
+            u_guess = deepcopy(u_prev_fwded)
+            can_use_guess = True # whether or not the guess can be used for the next step in case optimization fails
+
+        x_guess[:, 0] = obs[:, 0]
+        opti.set_initial(x_var, x_guess)
+        if self.mpc_env.hum_model == 'orca_casadi_kkt':
+            u_var_hums = opti_dict["u_var_hums"]
+            K_orca = self.mpc_env.orca_kkt_horiz if self.mpc_env.orca_kkt_horiz > 0 else self.horiz
+            u_var_guess = u_guess[:self.mpc_env.nu_r, :]
+            u_hums_guess = u_guess[self.mpc_env.nu_r:, :K_orca]
+            opti.set_initial(u_var, u_var_guess)
+            opti.set_initial(u_var_hums, u_hums_guess)
+        else:
+            opti.set_initial(u_var, u_guess)
+
+        if self.mpc_env.hum_model == 'orca_casadi_kkt':
+            init_obj_val = np.array([opti_dict['penalized_cost_fn'](
+                        x_var=x_guess,
+                        u_var=u_var_guess,
+                        u_var_hums=u_hums_guess,
+                        x_ref=goal_states,
+                        u_ref=goal_actions
+                    )['cost']]).item()
+        else:
+            init_obj_val = np.array([opti_dict['penalized_cost_fn'](
+                        x_var=x_guess,
+                        u_var=u_guess,
+                        x_ref=goal_states,
+                        u_ref=goal_actions
+                    )['cost']]).item()
+        end_ref = time.time()
+        refset_time = end_ref - start_ref
+
+        # Logging the intermediate optimization values via a callback function for the optimizer
+        if DO_DEBUG:
+            nlp_x_debug_vals = []
+            nlp_p_debug_vals = []
+            x_var_debug_vals = []
+            u_var_debug_vals = []
+            iter_debug_vals = []
+            f_debug_vals = []
+            def opti_callback(i, nlp_x_debug_vals=nlp_x_debug_vals, nlp_p_debug_vals=nlp_p_debug_vals, x_var_debug_vals=x_var_debug_vals, u_var_debug_vals=u_var_debug_vals, iter_debug_vals=iter_debug_vals, f_debug_vals=f_debug_vals):
+                logging.debug('[CAMPC OPTI CALLBACK] opt idx {:}'.format(i))
+                iter_debug_vals.append(i)
+                nlp_x_debug_vals.append(deepcopy(opti.debug.value(opti.x)))
+                nlp_p_debug_vals.append(deepcopy(opti.debug.value(opti.p)))
+                f_debug_vals.append(deepcopy(opti.debug.value(opti.f)))
+                x_var_debug_vals.append(deepcopy(self.debug_cs_functions['x_var_fn'](opti_x=opti.debug.value(opti.x))['x_var']))
+                u_var_debug_vals.append(deepcopy(self.debug_cs_functions['u_var_vec_fn'](opti_x=opti.debug.value(opti.x))['u_var_vec']))
+            opti.callback(opti_callback)
+        else:
+            x_var_debug_vals = []
+            u_var_debug_vals = []
+            iter_debug_vals = []
+            f_debug_vals = []
+            def opti_callback(i, x_var_debug_vals=x_var_debug_vals, u_var_debug_vals=u_var_debug_vals, iter_debug_vals=iter_debug_vals, f_debug_vals=f_debug_vals):
+                logging.debug('[CAMPC OPTI CALLBACK] opt idx {:}'.format(i))
+                infeas = opti.advanced.stats()['iterations']['inf_pr'][-1]
+                if infeas < 1e-3:
+                    iter_debug_vals.append(i)
+                    f_debug_vals.append(deepcopy(opti.debug.value(opti.f)))
+                    x_var_debug_vals.append(deepcopy(self.debug_cs_functions['x_var_fn'](opti_x=opti.debug.value(opti.x))['x_var']))
+                    u_var_debug_vals.append(deepcopy(self.debug_cs_functions['u_var_vec_fn'](opti_x=opti.debug.value(opti.x))['u_var_vec']))
+            # For some reason Casadi's opti sometimes fails when no callback is specifided. We also use this callback to get intermediate values
+            # through the iterations of the optimization, store feasible solutions and use the last feasible solution if the optimization exhausts
+            # the maximum number of iterations.
+            if self.do_callback_to_avoid_optifail:
+                opti.callback(opti_callback)
+
+
+        # Solve the optimization problem.
+        try:
+            if not dummy and DISP_TIME:
+                time_text = '. Prep time {:.3f}s'.format(refset_time)
+                logging.info('[CAMPC] Start solve step {:}{:}'.format(self.traj_step, time_text))
+            sol_start = time.time()
+            sol = opti.solve()
+            sol_end = time.time()
+            final_obj_val = sol.value(opti.f) # final objective value
+            opti_stats = opti.debug.stats()
+
+            if self.warmstart and final_obj_val > init_obj_val:  # smaller obj_value is better
+                # take the initial values as the solution
+                x_val = x_guess
+                u_val = u_guess
+                if self.mpc_env.hum_model == 'orca_casadi_kkt':
+                    u_val_hums = u_val[self.mpc_env.nu_r:, :K_orca]
+                    u_val = u_val[:self.mpc_env.nu_r, :]
+                debug_text = 'Solution worse than warmstart'
+
+                self.num_prev_used = 0
+                self.mpc_sol_succ.append(True)
+                time_text = ', Wall Time: {:.4f}'.format(sol_end-sol_start) if DISP_TIME else ''
+                logging.info('[CAMPC] Optim. success {:} but warmstart better step {:}, Initial: {:.3g} -> Final: {:.3g}{:}'.format(str(opti.debug.return_status()), self.traj_step, init_obj_val, final_obj_val, time_text))
+            else:
+                x_val, u_val = sol.value(x_var).reshape(x_var.shape), sol.value(u_var).reshape(u_var.shape)
+                if self.mpc_env.hum_model == 'orca_casadi_kkt':
+                    u_val_hums = sol.value(u_var_hums).reshape(u_var_hums.shape)
+                debug_text = opti.debug.return_status()
+                self.num_prev_used = 0
+                self.mpc_sol_succ.append(True)
+                time_text = ', Wall Time: {:.4f}'.format(sol_end-sol_start) if DISP_TIME else ''
+                logging.info('[CAMPC] Optim. success {:} step {:}. Initial: {:.3g} -> Final: {:.3g}. Num Iter: {:}{:}'.format(str(opti.debug.return_status()), self.traj_step, init_obj_val, final_obj_val, opti_stats['iter_count'], time_text))
+            print(f"u_val shape: {u_val.shape}")
+            print(u_val)
+            if u_val.ndim > 1:
+                actions = u_val
+                action = u_val[:, 0]
+            else:
+                actions = np.array([u_val])
+                action = np.array([u_val[0]])
+            self.prev_action = action   # FIXME: 但愿这个参数没有用到，因为如果我们修改把输出从x-rot改为x-y，那这个记录的参数就错了
+        except Exception as e:
+            sol_end = time.time()
+            
+            def deal_with_fail():
+                self.mpc_sol_succ.append(False)
+                time_text = ', Wall Time: {:.4f}'.format(sol_end-sol_start) if DISP_TIME else ''
+                logging.info('[CAMPC] Optim. error step {:}: {:}.  Num Iter: {:}{:}'.format(self.traj_step, str(opti.debug.return_status()), opti_stats['iter_count'], time_text))
+                logging.debug('[CAMPC] Error message {:}'.format(e))
+                debug_x_var = opti.debug.value(x_var)
+
+                if can_use_guess and self.warmstart and self.mpc_env.hum_model == 'orca_casadi_kkt':
+                    debug_text = deepcopy(str(opti.debug.return_status()) + ' USING WARMSTART GUESS')
+                    if len(u_guess.shape) > 1:
+                        actions = u_guess
+                        action = u_guess[:, 0]
+                    else:
+                        actions = np.array([u_guess])
+                        action = np.array([u_guess[0]])
+                    x_val = x_guess
+                    u_val = u_guess
+                    if self.mpc_env.hum_model == 'orca_casadi_kkt':
+                        u_val_hums = u_val[self.mpc_env.nu_r:, :K_orca]
+                        u_val = u_val[:self.mpc_env.nu_r, :]
+                elif can_use_guess and self.num_prev_used < self.reuse_K:
+                    debug_text = deepcopy(str(opti.debug.return_status()) + ' PREV. SOLN. FWDED')
+                    if len(u_prev_fwded.shape) > 1:
+                        actions = u_prev_fwded
+                        action = u_prev_fwded[:, 0]
+                    else:
+                        actions = np.array([u_prev_fwded])
+                        action = np.array([u_prev_fwded[0]])
+                    x_val = x_prev_fwded
+                    u_val = u_prev_fwded
+                    if self.mpc_env.hum_model == 'orca_casadi_kkt':
+                        u_val_hums = u_val[self.mpc_env.nu_r:, :K_orca]
+                        u_val = u_val[:self.mpc_env.nu_r, :]
+                    self.num_prev_used += 1
+                else:
+                    # Emergency braking controller
+                    debug_text = deepcopy(str(opti.debug.value) + ' EMER. BRAKE')
+                    cur_vel = x_guess[3, 0]
+                    actions = []
+                    rob_states = [np.atleast_2d(x_guess[:, 0]).T]
+                    f_still_moving = True
+                    count = 1
+                    while f_still_moving:
+                        if count > self.horiz:
+                            break
+                        lowest_feasible_vel = np.max((cur_vel + self.mpc_env.max_l_dcc*self.time_step, 0.0))
+
+                        prev_state = rob_states[count-1]
+                        next_action = np.array([lowest_feasible_vel, 0.0]+[0.0 for _ in range(self.mpc_env.nVars_hums)]+[0.0 for _ in range(self.mpc_env.nLambda)])
+                        actions.append(next_action)
+                        next_state = self.mpc_env.system_model.f_func(prev_state, next_action).toarray()
+                        rob_states.append(next_state)
+                        cur_vel = lowest_feasible_vel
+                        f_still_moving = lowest_feasible_vel - 0.0 > 1e-10
+                        count += 1
+                    action = actions[0]
+                    actions = np.array(actions)
+
+                    u_val = np.concatenate([np.atleast_2d(action).T for action in actions]+
+                                        [np.tile(np.atleast_2d(next_action).T, (1, self.horiz-len(actions)))], -1)
+                    if self.mpc_env.hum_model == 'orca_casadi_kkt':
+                        u_val_hums = u_val[self.mpc_env.nu_r:, :K_orca]
+                        u_val = u_val[:self.mpc_env.nu_r, :]
+                    x_val_noorca = np.concatenate([rob_state for rob_state in rob_states]+
+                                        [np.tile(next_state, (1, self.horiz-len(actions)))], -1)
+                    x_val_hums = debug_x_var[self.mpc_env.nx_r+self.mpc_env.np_g:,:]
+                    x_val = np.vstack([x_val_noorca[:self.mpc_env.nx_r+self.mpc_env.np_g,:], x_val_hums])
+                    self.num_prev_used = self.horiz + 1
+                if self.mpc_env.hum_model == 'orca_casadi_kkt':
+                    return actions, x_val, u_val, u_val_hums, debug_text
+                else:
+                    return actions, x_val, u_val, debug_text
+
+            opti_stats = opti.debug.stats()
+            # If return status is Maximum_Iterations_Exceeded, check initial and final cost values, and check feasibility of constraints
+            if opti.debug.return_status() == 'Maximum_Iterations_Exceeded' and len(iter_debug_vals) > 0:
+                last_iter = iter_debug_vals[-1]
+                final_obj_val = f_debug_vals[-1]
+
+                if self.warmstart and final_obj_val > init_obj_val:
+                    # take the initial values as the solution
+                    x_val = x_guess
+                    u_val = u_guess
+                    if self.mpc_env.hum_model == 'orca_casadi_kkt':
+                        u_val_hums = u_val[self.mpc_env.nu_r:, :K_orca]
+                        u_val = u_val[:self.mpc_env.nu_r, :]
+                    debug_text = 'Solution worse than warmstart'
+
+                    self.num_prev_used = 0
+                    self.mpc_sol_succ.append(True)
+                    time_text = ', Wall Time: {:.4f}'.format(sol_end-sol_start) if DISP_TIME else ''
+                    logging.info('[CAMPC] Optim. success {:} but warmstart better step {:}, Initial: {:.3g} -> Final: {:.3g}{:}'.format(str(opti.debug.return_status()), self.traj_step, init_obj_val, final_obj_val, time_text))
+                else:
+                    x_val = np.array(x_var_debug_vals[-1])
+                    u_val = np.array(u_var_debug_vals[-1])
+                    if self.mpc_env.hum_model == 'orca_casadi_kkt':
+                        u_val_hums = u_val[self.mpc_env.nu_r:, :K_orca]
+                        u_val = u_val[:self.mpc_env.nu_r, :]
+                    debug_text = opti.debug.return_status()
+                    self.num_prev_used = 0
+                    self.mpc_sol_succ.append(True)
+                    final_const_viol = opti.debug.value(opti.g)
+                    time_text = ', Wall Time: {:.4f}'.format(sol_end-sol_start) if DISP_TIME else ''
+                    logging.info('[CAMPC] Optim. success {:} step {:}. Initial: {:.3g} -> Final: {:.3g}. Num Iter: {:}{:}'.format(str(opti.debug.return_status()), self.traj_step, init_obj_val, final_obj_val, last_iter, time_text))
+                if u_val.ndim > 1:
+                    actions = u_val
+                    action = u_val[:, 0]
+                else:
+                    actions = np.array([u_val])
+                    action = np.array([u_val[0]])
+                self.prev_action = action
+            else:
+                if self.mpc_env.hum_model == 'orca_casadi_kkt':
+                    actions, x_val, u_val, u_val_hums, debug_text = deal_with_fail()
+                    action = actions[:, 0]
+                else:
+                    actions, x_val, u_val, debug_text = deal_with_fail()
+                    action = actions[:, 0]
+
+
+
+
+        sol_suc = True if self.mpc_sol_succ[-1] else False
+
+        if not dummy:
+            if opti_stats['return_status'] in return_stat_dict.keys():
+                log_status = return_stat_dict[opti_stats['return_status']]
+            else:
+                log_status = -5
+
+            self.solver_summary['traj_step'].append(self.traj_step)
+            self.solver_summary['sol_success'].append(int(sol_suc))
+            self.solver_summary['optim_status'].append(log_status)
+            self.solver_summary['iter_count'].append(opti_stats['iter_count'])
+            self.solver_summary['prep_time'].append(refset_time)
+            self.solver_summary['sol_time'].append(sol_end - sol_start)
+            self.solver_summary['final_nopenal_cost'].append(float(opti.debug.value(opti_dict['cost_mapac'])))
+            self.solver_summary['final_term_cost'].append(float(opti.debug.value(opti_dict['cost_term'])))
+            self.solver_summary['debug_text'].append(debug_text)
+            try:
+                self.solver_summary['ipopt_iterations'].append(deepcopy(opti_stats['iterations']))
+            except:
+                self.solver_summary['ipopt_iterations'].append([])
+
+
+        text = 'succ' if self.mpc_sol_succ[-1] else 'fail'
+        if not dummy and DO_DEBUG:
+            debug_orca_const_og_names, _ = self.get_debug_const_all(opti.debug.value(opti.x), opti.debug.value(opti.p), opti.debug.casadi_solver.get_function('nlp_g'))
+            debug_g_list = []
+            debug_x_vals_list = []
+            debug_p_vals_list = []
+            debug_f_vals = []
+            debug_nopenal_cost_vals = []
+            debug_opt_idx = []
+            for idx in range(len(x_var_debug_vals)):
+                iter = iter_debug_vals[idx]
+                debug_nlp_x = nlp_x_debug_vals[idx]
+                debug_nlp_p = nlp_p_debug_vals[idx]
+                debug_orca_const_names, debug_orca_const_all = self.get_debug_const_all(debug_nlp_x, debug_nlp_p, opti.debug.casadi_solver.get_function('nlp_g'))
+                debug_g_list.append(pd.Series(debug_orca_const_all[:,0].tolist(), index=debug_orca_const_og_names))
+                debug_x_vals_list.append(pd.Series(debug_nlp_x))
+                debug_p_vals_list.append(pd.Series(debug_nlp_p))
+                debug_f_vals.append(opti.debug.casadi_solver.get_function('nlp_f')(x=debug_nlp_x, p=debug_nlp_p)['f'].toarray().item())
+                debug_nopenal_cost_vals.append(opti_dict['nopenal_cost_fn'](opti_x=debug_nlp_x, opti_p=debug_nlp_p)['cost'].toarray().item())
+                debug_opt_idx.append(idx)
+            debug_g_df = pd.concat(debug_g_list, axis=1)
+            debug_x_vals_df = pd.concat(debug_x_vals_list, axis=1)
+            debug_p_vals_df = pd.concat(debug_p_vals_list, axis=1)
+            debug_g_df_tsp = debug_g_df.transpose()
+            debug_f_df = pd.DataFrame({
+                'opt_idx' : pd.Series(debug_opt_idx),
+                'f' : pd.Series(debug_f_vals),
+                'nopenal_cost' : pd.Series(debug_nopenal_cost_vals)
+            })
+            # Get the index values
+            index_values = debug_g_df_tsp.index.values
+            # Insert the index values as a new column at the first position
+            debug_g_df_tsp.insert(0, 'optidx', list(range(len(index_values))))
+            debug_ipopt_iter_df = pd.DataFrame(opti_stats['iterations'])
+            debug_ipopt_iter_df.insert(0, 'optidx', list(range(len(debug_ipopt_iter_df))))
+            debug_material = {
+                'campc/traj_step' : self.traj_step,
+                'campc/sol_success' : int(sol_suc),
+                'campc/optim_status' : log_status,
+                'campc/iter_count' : opti_stats['iter_count'],
+                'campc/prep_time' : refset_time,
+                'campc/sol_time' : sol_end - sol_start,
+                'campc/final_nopenal_cost' : float(opti.debug.value(opti_dict['cost_mapac'])),
+                'campc/final_term_cost' : float(opti.debug.value(opti_dict['cost_term'])),
+                'campc/debug_text' : debug_text,
+                'campc/debug/debug_x_df' : deepcopy(debug_x_vals_df),
+                'campc/debug/debug_f_df' : deepcopy(debug_f_df),
+                'campc/debug/debug_p_df' : deepcopy(debug_p_vals_df),
+                'campc/debug/debug_g_df' : deepcopy(debug_g_df_tsp),
+                'campc/debug/debug_ipopt_df' : deepcopy(debug_ipopt_iter_df),
+                'campc/debug/t_proc_callback_fun' : deepcopy(opti_stats['t_proc_callback_fun']),
+                'campc/debug/t_proc_nlp_f' : deepcopy(opti_stats['t_proc_nlp_f']),
+                'campc/debug/t_proc_nlp_g' : deepcopy(opti_stats['t_proc_nlp_g']),
+                'campc/debug/t_proc_nlp_grad' : deepcopy(opti_stats['t_proc_nlp_grad']),
+                'campc/debug/t_proc_nlp_grad_f' : deepcopy(opti_stats['t_proc_nlp_grad_f']),
+                'campc/debug/t_proc_nlp_hess_l' : deepcopy(opti_stats['t_proc_nlp_hess_l']),
+                'campc/debug/t_proc_nlp_jac_g' : deepcopy(opti_stats['t_proc_nlp_jac_g']),
+                'campc/debug/t_wall_callback_fun' : deepcopy(opti_stats['t_wall_callback_fun']),
+                'campc/debug/t_wall_nlp_f' : deepcopy(opti_stats['t_wall_nlp_f']),
+                'campc/debug/t_wall_nlp_g' : deepcopy(opti_stats['t_wall_nlp_g']),
+                'campc/debug/t_wall_nlp_grad' : deepcopy(opti_stats['t_wall_nlp_grad']),
+                'campc/debug/t_wall_nlp_grad_f' : deepcopy(opti_stats['t_wall_nlp_grad_f']),
+                'campc/debug/t_wall_nlp_hess_l' : deepcopy(opti_stats['t_wall_nlp_hess_l']),
+                'campc/debug/t_wall_nlp_jac_g' : deepcopy(opti_stats['t_wall_nlp_jac_g']),
+                'campc/debug/x_goals' : pd.DataFrame(goal_states),
+                'campc/debug/u_goals' : pd.DataFrame(goal_actions),
+                'campc/debug/x_guess' : pd.DataFrame(x_guess),
+                'campc/debug/u_guess' : pd.DataFrame(u_guess),
+                'campc/debug/x_val' : pd.DataFrame(x_val),
+                'campc/debug/u_val' : pd.DataFrame(u_val),
+                }
+            # dump debug material to a pickle file called debug_material.pkl
+            with open('debug_material.pkl', 'wb') as f:
+                logging.info('[CAMPC] Dumping debug material for solve step {:}'.format(self.traj_step))
+                pickle.dump(debug_material, f)
+
+            del nlp_x_debug_vals
+            del nlp_p_debug_vals
+            del x_var_debug_vals
+            del u_var_debug_vals
+            del iter_debug_vals
+        elif not dummy and DO_DEBUG_LITE:
+            debug_ipopt_iter_df = pd.DataFrame(opti_stats['iterations'])
+            debug_ipopt_iter_df.insert(0, 'optidx', list(range(len(debug_ipopt_iter_df))))
+            debug_material = {
+                'campc/traj_step' : self.traj_step,
+                'campc/sol_success' : int(sol_suc),
+                'campc/optim_status' : log_status,
+                'campc/iter_count' : opti_stats['iter_count'],
+                'campc/prep_time' : refset_time,
+                'campc/sol_time' : sol_end - sol_start,
+                'campc/final_nopenal_cost' : float(opti.debug.value(opti_dict['cost_mapac'])),
+                'campc/final_term_cost' : float(opti.debug.value(opti_dict['cost_term'])),
+                'campc/debug_text' : debug_text,
+                'campc/debug/debug_ipopt_df' : deepcopy(debug_ipopt_iter_df),
+                'campc/debug/t_proc_callback_fun' : deepcopy(opti_stats['t_proc_callback_fun']),
+                'campc/debug/t_proc_nlp_f' : deepcopy(opti_stats['t_proc_nlp_f']),
+                'campc/debug/t_proc_nlp_g' : deepcopy(opti_stats['t_proc_nlp_g']),
+                'campc/debug/t_proc_nlp_grad' : deepcopy(opti_stats['t_proc_nlp_grad']),
+                'campc/debug/t_proc_nlp_grad_f' : deepcopy(opti_stats['t_proc_nlp_grad_f']),
+                'campc/debug/t_proc_nlp_hess_l' : deepcopy(opti_stats['t_proc_nlp_hess_l']),
+                'campc/debug/t_proc_nlp_jac_g' : deepcopy(opti_stats['t_proc_nlp_jac_g']),
+                'campc/debug/t_wall_callback_fun' : deepcopy(opti_stats['t_wall_callback_fun']),
+                'campc/debug/t_wall_nlp_f' : deepcopy(opti_stats['t_wall_nlp_f']),
+                'campc/debug/t_wall_nlp_g' : deepcopy(opti_stats['t_wall_nlp_g']),
+                'campc/debug/t_wall_nlp_grad' : deepcopy(opti_stats['t_wall_nlp_grad']),
+                'campc/debug/t_wall_nlp_grad_f' : deepcopy(opti_stats['t_wall_nlp_grad_f']),
+                'campc/debug/t_wall_nlp_hess_l' : deepcopy(opti_stats['t_wall_nlp_hess_l']),
+                'campc/debug/t_wall_nlp_jac_g' : deepcopy(opti_stats['t_wall_nlp_jac_g']),
+                'campc/debug/x_goals' : pd.DataFrame(goal_states),
+                'campc/debug/u_goals' : pd.DataFrame(goal_actions),
+                'campc/debug/x_guess' : pd.DataFrame(x_guess),
+                'campc/debug/u_guess' : pd.DataFrame(u_guess),
+                'campc/debug/x_val' : pd.DataFrame(x_val),
+                'campc/debug/u_val' : pd.DataFrame(u_val),
+                }
+            # dump debug material to a pickle file called debug_material.pkl
+            with open('debug_material.pkl', 'wb') as f:
+                logging.info('[CAMPC] Dumping debug material for solve step {:}'.format(self.traj_step))
+                pickle.dump(debug_material, f)
+
+        self.x_prev = deepcopy(x_val)
+        if self.mpc_env.hum_model == 'orca_casadi_kkt':
+            if self.mpc_env.orca_kkt_horiz > 0:
+                self.u_prev = deepcopy(np.vstack([u_val, np.hstack([u_val_hums, np.tile(u_val_hums[:, -1].reshape(u_val_hums.shape[0],1), (1,self.horiz-self.mpc_env.orca_kkt_horiz))])]))
+            else:
+                self.u_prev = deepcopy(np.vstack([u_val, u_val_hums]))
+        else:
+            self.u_prev = deepcopy(u_val)
+
+        self.all_x_val.append(deepcopy(x_val))
+        self.all_u_val.append(deepcopy(u_val))
+        self.all_x_guess.append(deepcopy(x_guess))
+        self.all_u_guess.append(deepcopy(u_guess))
+        self.all_x_goals.append(deepcopy(goal_states))
+        self.all_u_goals.append(deepcopy(goal_actions))
+        self.all_debug_text.append(deepcopy(debug_text))
+
+        if return_all:
+            return actions, x_val, u_val
+        return actions
+
+
 
     def select_action(self, obs, joint_state, goal_states, goal_actions, return_all=False, dummy=False):
         """Solves nonlinear mpc problem to get next action.
@@ -1041,7 +1490,7 @@ class CollisionAvoidMPC(Policy):
         start_idx = 1
         if x_rob is None:
             for idx in range(start_idx, ref_steps+1):
-                dpg_x = self_state.gx - ref_x[idx-1]
+                dpg_x = self_state.gx - ref_x[idx-1]  # 从轨迹末尾开始计算差距
                 dpg_y = self_state.gy - ref_y[idx-1]
                 dpg_theta = np.arctan2(dpg_y, dpg_x) - ref_th[idx-1] if np.abs(dpg_y) > 1e-5 or np.abs(dpg_x) > 1e-5 else 0.0
 
@@ -1054,7 +1503,7 @@ class CollisionAvoidMPC(Policy):
                         v_pref = 0.0
 
                     ref_v[idx-1] = v_pref
-                    ref_om[idx-1] = dpg_theta / self.time_step
+                    ref_om[idx-1] = dpg_theta / self.time_step  # theta直接定义为theta的差除以时间间隔
                 else:
                     ref_v[idx-1] = u_rob[0,idx-1]
                     ref_om[idx-1] = u_rob[1,idx-1]
@@ -1326,13 +1775,16 @@ class CollisionAvoidMPC(Policy):
         mpc_state = self.mpc_env.convert_to_mpc_state_vector(state, self.mpc_env.nx_r, self.mpc_env.np_g, self.mpc_env.nX_hums, get_numpy=True)
 
         start_time = time.time()
-        mpc_action = self.select_action(mpc_state, state, goal_states, goal_actions)
+        actions = self.select_action_omnidirectional(mpc_state, state, goal_states, goal_actions)
+        mpc_action = actions[:, 0]
         end_time = time.time()
         print(f"len_mpc_action: {len(mpc_action)}")
         print(mpc_action)
 
-        action = ActionRot(mpc_action[0], mpc_action[1]*self.time_step)
-        self.prev_lvel = action.v
+        action = ActionRot(mpc_action[0], mpc_action[1]*self.time_step)  # time_step is the time between actions, default 0.25
+        # self.prev_lvel = action.v
+
+        # action = ActionXY(action.v * np.cos(action.r*self.time_step), action.v * np.sin(action.r*self.time_step))
 
 
         # step along trajectory
@@ -1341,5 +1793,5 @@ class CollisionAvoidMPC(Policy):
             logging.info('[CAMPC] Total wall time to solve MPC for step {:} was {:.3f}s'.format(self.traj_step, end_time-start_time))
 
         self.traj_step += 1
-        return action
+        return actions  
 
