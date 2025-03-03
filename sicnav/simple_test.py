@@ -201,17 +201,25 @@ def main():
         states.append(robot.get_joint_state(ob, static_obs))
         # if we use the load argument, generate the actions from the previously collected dataset
 
-        action = robot.act(ob, static_obs)
+
+
+        action = robot.act(ob, static_obs)  # action is of type ActionXY
+        # Set holonomic model for environent update
+        robot.policy.kinematics = 'holonomic'
+        robot.kinematics = 'holonomic'
 
         actions_array.append(action)
         ob, _, done, info = env.step(action)
-
 
         if isinstance(action, ActionRot):
             disp_vel = action.v
         elif isinstance(action, ActionXY):
             disp_vel = np.sqrt(action.vx**2 + action.vy**2)
         logging.info('[TEST PHASE] Policy time: {:.2f}, v: {:.3f} => displacement: {:.3f}'.format(env.global_time, disp_vel, disp_vel*env.time_step))
+
+        # Reset the kinematics back to unicycle as MPC uses unicycle model
+        robot.policy.kinematics = 'unicycle'
+        robot.kinematics = 'unicycle'
 
         coll_step = 0
         dang_step = 0
