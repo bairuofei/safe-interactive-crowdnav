@@ -79,8 +79,6 @@ class Robot(Agent):
         vx = diff_x / (len(action_list) * self.time_step)
         vy = diff_y / (len(action_list) * self.time_step)
         action = ActionXY(vx, vy)   
-        self.policy.kinematics = 'holonomic'
-        self.kinematics = 'holonomic'
         
         # next_state = self.get_next_full_state(action_list[0], original=False)
         # print(f"curr_state: {[state.self_state.px, state.self_state.py]}")
